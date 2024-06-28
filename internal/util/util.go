@@ -17,6 +17,8 @@
 package util
 
 import (
+	"crypto/md5"
+	"encoding/hex"
 	"reflect"
 	"sort"
 
@@ -275,4 +277,17 @@ func IntDerefToPointer(ptr *int, def int) *int {
 func Int64DerefToPointer(ptr *int64, def int64) *int64 {
 	i := pointer.Int64Deref(ptr, def)
 	return &i
+}
+
+// HashStrToMD5Key hashes a string to MD5
+func HashStrToMD5Key(s string) string {
+	// Create an MD5 hash of the URL
+	hash := md5.New()
+	hash.Write([]byte(s))
+	hashedBytes := hash.Sum(nil)
+
+	// Encode the hash as a hexadecimal string
+	hashedString := hex.EncodeToString(hashedBytes)
+
+	return hashedString
 }

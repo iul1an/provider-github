@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	corev1 "k8s.io/api/core/v1"
 	"reflect"
 	"sort"
 
@@ -52,12 +53,12 @@ import (
 )
 
 const (
-	errNotRepository = "managed resource is not a Repository custom resource"
-	errTrackPCUsage  = "cannot track ProviderConfig usage"
-	errGetPC         = "cannot get ProviderConfig"
-	errGetCreds      = "cannot get credentials"
-
-	errNewClient = "cannot create new Service"
+	errNotRepository           = "managed resource is not a Repository custom resource"
+	errTrackPCUsage            = "cannot track ProviderConfig usage"
+	errGetPC                   = "cannot get ProviderConfig"
+	errGetCreds                = "cannot get credentials"
+	errGetPasswordSecretFailed = "cannot get password secret"
+	errNewClient               = "cannot create new Service"
 )
 
 // Setup adds a controller that reconciles Repository managed resources.
@@ -120,10 +121,14 @@ func (c *connector) Connect(ctx context.Context, mg resource.Managed) (managed.E
 		return nil, errors.Wrap(err, errNewClient)
 	}
 
-	return &external{github: gh}, nil
+	return &external{
+		github: gh,
+		kube:   c.kube,
+	}, nil
 }
 
 type external struct {
+	kube   client.Client
 	github *ghclient.Client
 }
 
@@ -175,9 +180,14 @@ func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.Ex
 		if err != nil {
 			return managed.ExternalObservation{}, err
 		}
-		crWToConfig := getRepoWebhooksMapFromCr(cr.Spec.ForProvider.Webhooks)
-		ghWToConfig := getRepoWebhooksWithConfig(ghRepoWebhooks)
-
+		crWToConfig, err := getRepoWebhooksMapFromCr(c, ctx, cr.Spec.ForProvider.Webhooks)
+		if err != nil {
+			return managed.ExternalObservation{}, err
+		}
+		ghWToConfig, err := getRepoWebhooksWithConfig(c, ctx, ghRepoWebhooks, cr)
+		if err != nil {
+			return managed.ExternalObservation{}, err
+		}
 		if !reflect.DeepEqual(ghWToConfig, crWToConfig) {
 			return notUpToDate, nil
 		}
@@ -259,13 +269,17 @@ func getUserPermissionMapFromCr(users []v1alpha1.RepositoryUser) map[string]stri
 	return crMToPermission
 }
 
-func getRepoWebhooksMapFromCr(webhooks []v1alpha1.RepositoryWebhook) map[string]v1alpha1.RepositoryWebhook {
+func getRepoWebhooksMapFromCr(c *external, ctx context.Context, webhooks []v1alpha1.RepositoryWebhook) (map[string]v1alpha1.RepositoryWebhook, error) {
 	crWToConfig := make(map[string]v1alpha1.RepositoryWebhook, len(webhooks))
 
 	for _, webhook := range webhooks {
 		// handle optional *bool fields
 		insecureSsl := util.BoolDerefToPointer(webhook.InsecureSsl, false)
 		active := util.BoolDerefToPointer(webhook.Active, true)
+		secret, err := getRepoWebhookSecretFromRef(c, ctx, &webhook)
+		if err != nil {
+			return nil, err
+		}
 
 		// sort events to aid comparison between desired and actual state
 		sort.Strings(webhook.Events)
@@ -276,9 +290,71 @@ func getRepoWebhooksMapFromCr(webhooks []v1alpha1.RepositoryWebhook) map[string]
 			ContentType: webhook.ContentType,
 			Events:      webhook.Events,
 			Active:      active,
+			Secret:      &secret,
 		}
 	}
-	return crWToConfig
+	return crWToConfig, nil
+}
+
+func getRepoWebhookSecretFromRef(c *external, ctx context.Context, webhook *v1alpha1.RepositoryWebhook) (secret string, err error) {
+	if webhook.SecretKeyRef == nil {
+		return "", nil
+	}
+	nn := types.NamespacedName{
+		Name:      webhook.SecretKeyRef.Name,
+		Namespace: webhook.SecretKeyRef.Namespace,
+	}
+	s := &corev1.Secret{}
+	if err := c.kube.Get(ctx, nn, s); err != nil {
+		return "", errors.Wrap(err, errGetPasswordSecretFailed)
+	}
+	secretKey := webhook.SecretKeyRef.Key
+	secretValue := string(s.Data[secretKey])
+	return secretValue, nil
+}
+
+func getRepoWebhookSecretFromState(c *external, ctx context.Context, cr *v1alpha1.Repository, webhook *github.Hook) (secret string, err error) {
+	if cr.Spec.WriteConnectionSecretToReference == nil {
+		return "", nil
+	}
+	nn := types.NamespacedName{
+		Name:      cr.Spec.WriteConnectionSecretToReference.Name,
+		Namespace: cr.Spec.WriteConnectionSecretToReference.Namespace,
+	}
+	s := &corev1.Secret{}
+	if err := c.kube.Get(ctx, nn, s); err != nil {
+		return "", errors.Wrap(err, errGetPasswordSecretFailed)
+	}
+	secretKey := util.HashStrToMD5Key(webhook.Config.GetURL())
+	secretValue := string(s.Data[secretKey])
+	return secretValue, nil
+}
+
+func updateConnectionSecret(c *external, ctx context.Context, cr *v1alpha1.Repository, secretKey, secretValue string) error {
+	if cr.Spec.WriteConnectionSecretToReference == nil {
+		return errors.New("spec.writeConnectionSecretToReference is not set")
+	}
+	nn := types.NamespacedName{
+		Name:      cr.Spec.WriteConnectionSecretToReference.Name,
+		Namespace: cr.Spec.WriteConnectionSecretToReference.Namespace,
+	}
+	s := &corev1.Secret{}
+	if err := c.kube.Get(ctx, nn, s); err != nil {
+		return err
+	}
+
+	// Ensure the secret's Data field is initialized
+	if s.Data == nil {
+		s.Data = make(map[string][]byte)
+	}
+	// Update the secret with the provided key and value
+	s.Data[secretKey] = []byte(secretValue)
+
+	// Apply the update to the Kubernetes API
+	if err := c.kube.Update(ctx, s); err != nil {
+		return err
+	}
+	return nil
 }
 
 func getRepoWebhooks(ctx context.Context, gh *ghclient.Client, org, repoName string) ([]*github.Hook, error) {
@@ -301,7 +377,7 @@ func getRepoWebhooks(ctx context.Context, gh *ghclient.Client, org, repoName str
 	return allHooks, nil
 }
 
-func getRepoWebhooksWithConfig(hooks []*github.Hook) map[string]v1alpha1.RepositoryWebhook {
+func getRepoWebhooksWithConfig(c *external, ctx context.Context, hooks []*github.Hook, repo *v1alpha1.Repository) (map[string]v1alpha1.RepositoryWebhook, error) {
 	wToConfig := make(map[string]v1alpha1.RepositoryWebhook)
 
 	for _, h := range hooks {
@@ -311,16 +387,26 @@ func getRepoWebhooksWithConfig(hooks []*github.Hook) map[string]v1alpha1.Reposit
 		if h.Config.InsecureSSL != nil && *h.Config.InsecureSSL == "1" {
 			insecureSslBool = true
 		}
+		secret := h.Config.GetSecret()
+		if secret != "" {
+			var err error
+			secret, err = getRepoWebhookSecretFromState(c, ctx, repo, h)
+			if err != nil {
+				return nil, err
+			}
+		}
 		wToConfig[url] = v1alpha1.RepositoryWebhook{
 			Url:         url,
 			InsecureSsl: &insecureSslBool,
 			ContentType: contentType,
 			Events:      h.Events,
 			Active:      h.Active,
+			Secret:      &secret,
 		}
 	}
 
-	return wToConfig
+	return wToConfig, nil
+
 }
 
 func getRepoWebhookId(hooks []*github.Hook, webhookUrl string) (*int64, error) {
@@ -706,11 +792,19 @@ func (c *external) Create(ctx context.Context, mg resource.Managed) (managed.Ext
 
 	if cr.Spec.ForProvider.Webhooks != nil {
 		// getRepoWebhooksMapFromCr() provides defaults for optional *bool fields
-		hooksMap := getRepoWebhooksMapFromCr(cr.Spec.ForProvider.Webhooks)
+		hooksMap, err := getRepoWebhooksMapFromCr(c, ctx, cr.Spec.ForProvider.Webhooks)
+		if err != nil {
+			return managed.ExternalCreation{}, err
+		}
 		for key := range hooksMap {
 			// avoid "G601: Implicit memory aliasing in for loop"
 			hook := hooksMap[key]
-			_, _, err := c.github.Repositories.CreateHook(ctx, cr.Spec.ForProvider.Org, name, crRepoHookToHookConfig(hook))
+			config := crRepoHookToHookConfig(hook)
+			_, _, err = c.github.Repositories.CreateHook(ctx, cr.Spec.ForProvider.Org, name, config)
+			if err != nil {
+				return managed.ExternalCreation{}, err
+			}
+			err = updateConnectionSecret(c, ctx, cr, util.HashStrToMD5Key(hook.Url), *config.Config.Secret)
 			if err != nil {
 				return managed.ExternalCreation{}, err
 			}
@@ -813,6 +907,7 @@ func crRepoHookToHookConfig(hook v1alpha1.RepositoryWebhook) *github.Hook {
 			ContentType: &hook.ContentType,
 			InsecureSSL: &insecureSsl,
 			URL:         &hook.Url,
+			Secret:      hook.Secret,
 		},
 		Events: hook.Events,
 		Active: hook.Active,
@@ -820,13 +915,19 @@ func crRepoHookToHookConfig(hook v1alpha1.RepositoryWebhook) *github.Hook {
 }
 
 //nolint:gocyclo
-func updateRepoWebhooks(ctx context.Context, cr *v1alpha1.Repository, gh *ghclient.Client, repoName string) error {
+func updateRepoWebhooks(c *external, ctx context.Context, cr *v1alpha1.Repository, gh *ghclient.Client, repoName string) error {
 	ghRepoWebhooks, err := getRepoWebhooks(ctx, gh, cr.Spec.ForProvider.Org, repoName)
 	if err != nil {
 		return err
 	}
-	crWToConfig := getRepoWebhooksMapFromCr(cr.Spec.ForProvider.Webhooks)
-	ghWToConfig := getRepoWebhooksWithConfig(ghRepoWebhooks)
+	crWToConfig, err := getRepoWebhooksMapFromCr(c, ctx, cr.Spec.ForProvider.Webhooks)
+	if err != nil {
+		return err
+	}
+	ghWToConfig, err := getRepoWebhooksWithConfig(c, ctx, ghRepoWebhooks, cr)
+	if err != nil {
+		return err
+	}
 
 	toDelete, toAdd, toUpdate := util.DiffRepoWebhooks(ghWToConfig, crWToConfig)
 
@@ -843,7 +944,13 @@ func updateRepoWebhooks(ctx context.Context, cr *v1alpha1.Repository, gh *ghclie
 	}
 
 	for _, hook := range toAdd {
-		_, _, err := gh.Repositories.CreateHook(ctx, cr.Spec.ForProvider.Org, repoName, crRepoHookToHookConfig(hook))
+		config := crRepoHookToHookConfig(hook)
+		_, _, err = gh.Repositories.CreateHook(ctx, cr.Spec.ForProvider.Org, repoName, config)
+		if err != nil {
+			return err
+		}
+		fmt.Println(*config.Config.Secret)
+		err = updateConnectionSecret(c, ctx, cr, util.HashStrToMD5Key(hook.Url), *config.Config.Secret)
 		if err != nil {
 			return err
 		}
@@ -854,7 +961,12 @@ func updateRepoWebhooks(ctx context.Context, cr *v1alpha1.Repository, gh *ghclie
 		if err != nil {
 			return err
 		}
-		_, _, err = gh.Repositories.EditHook(ctx, cr.Spec.ForProvider.Org, repoName, *id, crRepoHookToHookConfig(hook))
+		config := crRepoHookToHookConfig(hook)
+		_, _, err = gh.Repositories.EditHook(ctx, cr.Spec.ForProvider.Org, repoName, *id, config)
+		if err != nil {
+			return err
+		}
+		err = updateConnectionSecret(c, ctx, cr, util.HashStrToMD5Key(hook.Url), *config.Config.Secret)
 		if err != nil {
 			return err
 		}
@@ -1492,7 +1604,7 @@ func (c *external) Update(ctx context.Context, mg resource.Managed) (managed.Ext
 	}
 
 	if cr.Spec.ForProvider.Webhooks != nil {
-		err = updateRepoWebhooks(ctx, cr, c.github, name)
+		err = updateRepoWebhooks(c, ctx, cr, c.github, name)
 		if err != nil {
 			return managed.ExternalUpdate{}, err
 		}

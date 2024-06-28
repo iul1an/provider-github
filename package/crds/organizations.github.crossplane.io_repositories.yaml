@@ -767,6 +767,26 @@ spec:
                             are subject to man-in-the-middle and other attacks. Default:
                             false'
                           type: boolean
+                        secretKeyRef:
+                          description: Reference to a secret key containing the webhook
+                            secret. You can use the webhook secret to limit incoming
+                            requests to only those originating from GitHub. For more
+                            information, see https://docs.github.com/en/webhooks/using-webhooks/validating-webhook-deliveries
+                          properties:
+                            key:
+                              description: The key to select.
+                              type: string
+                            name:
+                              description: Name of the secret.
+                              type: string
+                            namespace:
+                              description: Namespace of the secret.
+                              type: string
+                          required:
+                          - key
+                          - name
+                          - namespace
+                          type: object
                         url:
                           description: The URL to which the payloads will be delivered.
                           type: string
