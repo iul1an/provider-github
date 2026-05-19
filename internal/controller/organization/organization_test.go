@@ -165,7 +165,7 @@ func TestObserve(t *testing.T) {
 						},
 						Actions: &fake.MockActionsClient{
 							MockListEnabledReposInOrg: func(ctx context.Context, owner string, opts *github.ListOptions) (*github.ActionsEnabledOnOrgRepos, *github.Response, error) {
-								return githubOrgRepoActions(), nil, nil
+								return githubOrgRepoActions(), fake.GenerateEmptyResponse(), nil
 							},
 							MockGetOrgSecret: func(ctx context.Context, org, name string) (*github.Secret, *github.Response, error) {
 								return nil, fake.GenerateEmptyResponse(), nil
@@ -213,7 +213,7 @@ func TestObserve(t *testing.T) {
 						},
 						Actions: &fake.MockActionsClient{
 							MockListEnabledReposInOrg: func(ctx context.Context, owner string, opts *github.ListOptions) (*github.ActionsEnabledOnOrgRepos, *github.Response, error) {
-								return githubOrgRepoActions(), nil, nil
+								return githubOrgRepoActions(), fake.GenerateEmptyResponse(), nil
 							},
 							MockGetOrgSecret: func(ctx context.Context, org, name string) (*github.Secret, *github.Response, error) {
 								return githubOrgSecret(), fake.GenerateEmptyResponse(), nil
@@ -314,5 +314,133 @@ func TestObserve(t *testing.T) {
 				t.Errorf("\n%s\ne.Observe(...): -want, +got:\n%s\n", tc.reason, diff)
 			}
 		})
+	}
+}
+
+// listEnabledReposInOrg must iterate beyond the first page when GitHub
+// returns NextPage > 0. Without pagination, only page 1 is visible to
+// the diff against the CR's enabled-repos list, every CR-declared repo
+// past page 1 looks "missing", and the controller burns calls
+// re-Adding repos that are already enabled.
+func TestListEnabledReposInOrg_Paginates(t *testing.T) {
+	pages := [][]*github.Repository{
+		{{Name: github.String("a")}, {Name: github.String("b")}},
+		{{Name: github.String("c")}},
+	}
+	calls := 0
+	gh := &ghclient.RateLimitClient{
+		Client: &ghclient.Client{
+			Actions: &fake.MockActionsClient{
+				MockListEnabledReposInOrg: func(ctx context.Context, owner string, opts *github.ListOptions) (*github.ActionsEnabledOnOrgRepos, *github.Response, error) {
+					i := calls
+					calls++
+					resp := &github.ActionsEnabledOnOrgRepos{Repositories: pages[i]}
+					httpResp := fake.GenerateEmptyResponse()
+					if i < len(pages)-1 {
+						httpResp.NextPage = i + 2
+					}
+					return resp, httpResp, nil
+				},
+			},
+		},
+	}
+
+	got, err := listEnabledReposInOrg(context.Background(), gh, "test-org")
+	if err != nil {
+		t.Fatalf("listEnabledReposInOrg: %v", err)
+	}
+	if calls != len(pages) {
+		t.Errorf("upstream called %d times, want %d (loop exited early — pagination broken)", calls, len(pages))
+	}
+	if len(got) != 3 {
+		t.Fatalf("returned %d repos, want 3 (page contents not concatenated)", len(got))
+	}
+	names := []string{*got[0].Name, *got[1].Name, *got[2].Name}
+	want := []string{"a", "b", "c"}
+	if diff := cmp.Diff(want, names); diff != "" {
+		t.Errorf("names mismatch (-want +got):\n%s", diff)
+	}
+}
+
+// setEnabledReposForActions must skip the PUT when the org's current
+// enabled-repos list already matches the CR. This protects against
+// wasteful idempotent writes when Observe flagged the CR as out-of-date
+// for some other reason (e.g. description or secrets drifted).
+func TestSetEnabledReposForActions_SkipsWhenAlreadyMatching(t *testing.T) {
+	setCalled := false
+	gh := &ghclient.RateLimitClient{
+		Client: &ghclient.Client{
+			Actions: &fake.MockActionsClient{
+				MockListEnabledReposInOrg: func(ctx context.Context, owner string, opts *github.ListOptions) (*github.ActionsEnabledOnOrgRepos, *github.Response, error) {
+					return &github.ActionsEnabledOnOrgRepos{
+						Repositories: []*github.Repository{{Name: github.String("r1")}, {Name: github.String("r2")}},
+					}, fake.GenerateEmptyResponse(), nil
+				},
+				MockSetEnabledReposInOrg: func(ctx context.Context, owner string, ids []int64) (*github.Response, error) {
+					setCalled = true
+					return fake.GenerateEmptyResponse(), nil
+				},
+			},
+		},
+	}
+	cr := organization([]string{"r1", "r2"})
+	if err := setEnabledReposForActions(context.Background(), gh, org, cr); err != nil {
+		t.Fatalf("setEnabledReposForActions: %v", err)
+	}
+	if setCalled {
+		t.Error("SetEnabledReposInOrg was called even though current state matched CR — wastes one API call per Update when the drift is elsewhere")
+	}
+}
+
+// setEnabledReposForActions must call SetEnabledReposInOrg exactly once
+// with the IDs of all repos in the CR spec, and it must seed the
+// repo-name→ID cache from the list response so it only fetches IDs for
+// newly-added repos. Without that optimization, every Update on a large
+// org would re-fetch every repo's ID — O(N) avoidable Get calls.
+func TestSetEnabledReposForActions_CallsSetWithResolvedIDs(t *testing.T) {
+	idR1, idR2 := int64(11), int64(22)
+	var setIDs []int64
+	setCalls := 0
+	var lookedUp []string
+	gh := &ghclient.RateLimitClient{
+		Client: &ghclient.Client{
+			Actions: &fake.MockActionsClient{
+				MockListEnabledReposInOrg: func(ctx context.Context, owner string, opts *github.ListOptions) (*github.ActionsEnabledOnOrgRepos, *github.Response, error) {
+					// Org currently has only r1 (with ID, as real GitHub returns); CR wants r1+r2.
+					return &github.ActionsEnabledOnOrgRepos{
+						Repositories: []*github.Repository{{Name: github.String("r1"), ID: &idR1}},
+					}, fake.GenerateEmptyResponse(), nil
+				},
+				MockSetEnabledReposInOrg: func(ctx context.Context, owner string, ids []int64) (*github.Response, error) {
+					setCalls++
+					setIDs = append([]int64(nil), ids...)
+					return fake.GenerateEmptyResponse(), nil
+				},
+			},
+			Repositories: &fake.MockRepositoriesClient{
+				MockGet: func(ctx context.Context, owner, repoName string) (*github.Repository, *github.Response, error) {
+					lookedUp = append(lookedUp, repoName)
+					if repoName == "r2" {
+						return &github.Repository{ID: &idR2, Name: github.String("r2")}, fake.GenerateEmptyResponse(), nil
+					}
+					t.Fatalf("unexpected repo lookup: %s (cache seeding should have made this unnecessary)", repoName)
+					return nil, nil, nil
+				},
+			},
+		},
+	}
+	cr := organization([]string{"r1", "r2"})
+	if err := setEnabledReposForActions(context.Background(), gh, org, cr); err != nil {
+		t.Fatalf("setEnabledReposForActions: %v", err)
+	}
+	if setCalls != 1 {
+		t.Errorf("SetEnabledReposInOrg called %d times, want 1 (single bulk replace is the point of Option 1)", setCalls)
+	}
+	want := []int64{idR1, idR2}
+	if diff := cmp.Diff(want, setIDs); diff != "" {
+		t.Errorf("Set IDs mismatch (-want +got):\n%s", diff)
+	}
+	if diff := cmp.Diff([]string{"r2"}, lookedUp); diff != "" {
+		t.Errorf("Repositories.Get lookups mismatch (-want +got):\n%s\nCache seeding from listEnabledReposInOrg result must skip already-enabled repos.", diff)
 	}
 }

@@ -472,6 +472,12 @@ func (rac *RateLimitActionsClient) RemoveEnabledReposInOrg(ctx context.Context, 
 	return resp, err
 }
 
+func (rac *RateLimitActionsClient) SetEnabledReposInOrg(ctx context.Context, owner string, repositoryIDs []int64) (*github.Response, error) {
+	resp, err := rac.ActionsClient.SetEnabledReposInOrg(ctx, owner, repositoryIDs)
+	recordResponse(rac.metrics, rac.org, rac.appID, rac.installationID, rac.cacheKey, "Actions.SetEnabledReposInOrg", resp, err)
+	return resp, err
+}
+
 func (rac *RateLimitActionsClient) GetOrgSecret(ctx context.Context, org, name string) (*github.Secret, *github.Response, error) {
 	return recordRateLimit(ctx, rac.metrics, rac.org, rac.appID, rac.installationID, rac.cacheKey, "Actions.GetOrgSecret", func() (*github.Secret, *github.Response, error) {
 		return rac.ActionsClient.GetOrgSecret(ctx, org, name)
